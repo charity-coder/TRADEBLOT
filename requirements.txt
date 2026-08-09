@@ -1,0 +1,7 @@
+streamlit>=1.60
+pandas>=2.0
+numpy>=1.24
+plotly>=6.0
+pdfplumber>=0.11
+pytesseract>=0.3
+pillow>=10.0
