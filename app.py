@@ -1,43 +1,81 @@
-"""
-FX Signal Dial — Streamlit port of the React "Composite Signal Engine" dashboard.
-
-Run with:
-    streamlit run app.py
-"""
-
 import io
+import os
 import re
-from dataclasses import dataclass, field
+import shutil
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import pdfplumber
+import pytesseract
 import streamlit as st
-import plotly.graph_objects as go
 from PIL import Image
+import plotly.graph_objects as go
 
-try:
-    import pytesseract
-    OCR_AVAILABLE = True
+"""FX Signal Dial — Streamlit port of the React "Composite Signal Engine" dashboard."""
+# ---------------------------------------------------------------------------
+# Tesseract OCR setup
+# ---------------------------------------------------------------------------
+def _find_tesseract():
+    """Find a working Tesseract executable on Windows."""
+    candidates = []
 
-    # Windows often doesn't pick up PATH changes made via the registry until
-    # a full logoff/restart, and some setups never add tesseract to PATH at
-    # all. Point pytesseract straight at the common install locations so OCR
-    # works regardless of PATH state.
-    import os
-    _COMMON_WIN_PATHS = [
+    # Explicit override has highest priority.
+    env_cmd = os.environ.get("TESSERACT_CMD")
+    if env_cmd:
+        candidates.append(env_cmd.strip().strip('"'))
+
+    # Common installation locations.
+    candidates.extend([
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    if not os.environ.get("TESSERACT_CMD"):
-        for _p in _COMMON_WIN_PATHS:
-            if os.path.isfile(_p):
-                pytesseract.pytesseract.tesseract_cmd = _p
-                break
-    else:
-        pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
-except ImportError:
-    OCR_AVAILABLE = False
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+    ])
+
+    # Search PATH.
+    path_cmd = shutil.which("tesseract")
+    if path_cmd:
+        candidates.append(path_cmd)
+
+    # Search Windows registry when available.
+    try:
+        import winreg
+        for root, subkey in [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tesseract-OCR"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tesseract-OCR"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Tesseract-OCR"),
+        ]:
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+                    candidates.append(os.path.join(install_dir, "tesseract.exe"))
+            except OSError:
+                pass
+    except ImportError:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
+TESSERACT_PATH = _find_tesseract()
+OCR_AVAILABLE = TESSERACT_PATH is not None
+
+if OCR_AVAILABLE:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    try:
+        # Verify that the executable actually runs.
+        pytesseract.get_tesseract_version()
+    except Exception:
+        OCR_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Design tokens (kept close to the original React version)
@@ -322,34 +360,26 @@ def extract_from_image(file_bytes):
     """OCR a JPG/PNG and parse whatever tabular text comes out."""
     if not OCR_AVAILABLE:
         raise RuntimeError(
-            "pytesseract is installed but the 'tesseract' binary isn't on PATH. "
-            "Install it with `apt-get install tesseract-ocr` (Linux) or "
-            "`brew install tesseract` (Mac), then restart the app."
+            "Tesseract OCR is not installed or could not be found. "
+            "Install Tesseract OCR, then restart this Streamlit app. "
+            "You can also set TESSERACT_CMD to the full path of tesseract.exe."
         )
-    img = Image.open(io.BytesIO(file_bytes))
-    text = pytesseract.image_to_string(img)
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        # psm 6 works well for screenshots/tables and keeps the OCR deterministic.
+        text = pytesseract.image_to_string(img, config="--psm 6")
+    except pytesseract.TesseractNotFoundError as e:
+        raise RuntimeError(
+            f"Tesseract executable could not be run at: {TESSERACT_PATH}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"OCR failed: {e}") from e
+
     return parse_ohlc_text(text), "OCR"
-
-
-def clean_ohlc_df(df):
-    """Validate/normalize a user-reviewed extraction into the canonical
-    date/open/high/low/close frame the pipeline expects, or None if it
-    can't be made usable."""
-    if df is None or df.empty or not {"date", "open", "high", "low", "close"}.issubset(df.columns):
-        return None
-    out = df.copy()
-    for col in ["open", "high", "low", "close"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out["_date"] = pd.to_datetime(out["date"], errors="coerce")
-    out = out.dropna(subset=["_date", "close"])
-    if out.empty:
-        return None
-    out["open"] = out["open"].fillna(out["close"])
-    out["high"] = out["high"].fillna(out[["open", "close"]].max(axis=1))
-    out["low"] = out["low"].fillna(out[["open", "close"]].min(axis=1))
-    out = out.sort_values("_date")
-    out["date"] = out["_date"].dt.strftime("%Y-%m-%d")
-    return out[["date", "open", "high", "low", "close"]].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +639,16 @@ def _process_uploaded_bytes(file_bytes: bytes, filename: str):
 
 with st.sidebar:
     st.header("Controls")
+
+    if OCR_AVAILABLE:
+        st.success(f"✅ OCR ready")
+        st.caption(f"Tesseract: {TESSERACT_PATH}")
+    else:
+        st.warning("⚠️ OCR unavailable")
+        st.caption(
+            "CSV/PDF extraction still works. Install Tesseract for JPG/PNG "
+            "and camera OCR, then restart Streamlit."
+        )
     pair_id = st.selectbox("Pair", options=list(PAIRS.keys()), format_func=lambda k: PAIRS[k]["name"])
 
     bc1, bc2 = st.columns(2)
