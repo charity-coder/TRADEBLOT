@@ -784,6 +784,7 @@ def extract_ohlc_from_chart_image(file_bytes):
         "price_labels_found": 0,
         "calibration": None,
         "warnings": [],
+        "manually_calibrated": False,
     }
     empty = pd.DataFrame(columns=["date", "open", "high", "low", "close"])
 
@@ -875,6 +876,26 @@ def extract_ohlc_from_chart_image(file_bytes):
         })
 
     return pd.DataFrame(rows), "chart vision", diagnostics
+
+
+def apply_manual_price_calibration(df: pd.DataFrame, price_top: float, price_bottom: float) -> pd.DataFrame:
+    """Rescale a chart-vision extraction's normalized 0-100 open/high/low/
+    close values into real prices via linear interpolation, given the price
+    shown at the top and bottom of the plot area. Used when Y-axis OCR
+    couldn't calibrate automatically and the user enters the two reference
+    prices by hand instead."""
+    out = df.copy()
+
+    def interp(v):
+        if pd.isna(v):
+            return v
+        frac = float(v) / 100.0
+        return price_bottom + frac * (price_top - price_bottom)
+
+    for col in ["open", "high", "low", "close"]:
+        if col in out.columns:
+            out[col] = out[col].apply(interp).round(5)
+    return out
 
 
 def clean_ohlc_df(df):
@@ -1454,11 +1475,63 @@ if pending is not None:
                 st.caption(f"Candles detected: {cv_diag['candles_found']}")
             with d3:
                 calibrated = cv_diag["calibration"] is not None
-                st.caption(
-                    f"Price calibration: {'✅ from ' + str(cv_diag['price_labels_found']) + ' axis label(s)' if calibrated else '⚠️ normalized 0-100 scale'}"
-                )
+                manually_cal = cv_diag.get("manually_calibrated", False)
+                if manually_cal:
+                    cal_label = "✅ manually calibrated"
+                elif calibrated:
+                    cal_label = f"✅ from {cv_diag['price_labels_found']} axis label(s)"
+                else:
+                    cal_label = "⚠️ normalized 0-100 scale"
+                st.caption(f"Price calibration: {cal_label}")
             for w in cv_diag["warnings"]:
                 st.caption(f"⚠️ {w}")
+
+            # Manual calibration fallback: only offered when chart-vision
+            # ran, produced rows, and couldn't calibrate against real
+            # Y-axis labels on its own. Lets the user type in the price at
+            # the top and bottom of the plot area and linearly rescales
+            # every open/high/low/close value in pending["df"] from the
+            # normalized 0-100 scale into real prices.
+            if (
+                pending["method"] == "chart vision"
+                and cv_diag["calibration"] is None
+                and not cv_diag.get("manually_calibrated", False)
+                and not pending["df"].empty
+            ):
+                st.markdown("---")
+                st.markdown("**Manual price calibration**")
+                st.caption(
+                    "OCR couldn't read the Y-axis price labels. Enter the price shown at the top "
+                    "and bottom of the chart's plot area and I'll convert the normalized values "
+                    "into real prices."
+                )
+                mc1, mc2, mc3 = st.columns([1, 1, 0.8])
+                with mc1:
+                    manual_price_top = st.number_input(
+                        "Price at top of plot area", value=1.10000, format="%.5f", key="manual_price_top"
+                    )
+                with mc2:
+                    manual_price_bottom = st.number_input(
+                        "Price at bottom of plot area", value=1.05000, format="%.5f", key="manual_price_bottom"
+                    )
+                with mc3:
+                    st.write("")
+                    st.write("")
+                    apply_calibration = st.button("Apply calibration", use_container_width=True)
+                if apply_calibration:
+                    if manual_price_top <= manual_price_bottom:
+                        st.error("Top price must be greater than bottom price.")
+                    else:
+                        pending["df"] = apply_manual_price_calibration(
+                            pending["df"], manual_price_top, manual_price_bottom
+                        )
+                        cv_diag["manually_calibrated"] = True
+                        pending["chart_vision_diagnostics"] = cv_diag
+                        st.session_state.pending_extraction = pending
+                        st.success(
+                            f"Applied calibration: {manual_price_bottom:.5f} – {manual_price_top:.5f}"
+                        )
+                        st.rerun()
 
         if pending["df"].empty:
             st.warning(
